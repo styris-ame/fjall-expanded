@@ -9,12 +9,14 @@ storekey = { version = "0.11.0", features = ["bytes", "uuid", "derive"] }
 fjall = { version = "3", default-features = false }
 anyhow = "1"
 rkyv = { version = "0.8", default-features = false, features = ["unaligned"] }
-easy_rkyv = { path = "../easy_rkyv", default-features = false, features = [
+
+easy_rkyv = { git = "https://github.com/styris-ame/easy-rkyv", default-features = false, features = [
   "debug_validate",
   "unaligned",
 ] }
 bytes = "1"
-migrateable = { path = "../migrateable", optional = true }
+
+migrateable = { git = "https://github.com/styris-ame/migrateable-rs", optional = true }
 log = "0.4"
 tempfile = "3"
 tar = "0.4"
