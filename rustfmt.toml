@@ -1,0 +1,7 @@
+edition = "2024"
+max_width = 130
+array_width = 110
+attr_fn_like_width = 130
+chain_width = 110
+fn_call_width = 110
+use_small_heuristics = "Off"

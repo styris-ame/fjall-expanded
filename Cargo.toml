@@ -1,0 +1,35 @@
+[package]
+name = "fjall_expanded"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fjall_expanded_derive = { version = "0.1.0", path = "fjall_expanded_derive", optional = true }
+storekey = { version = "0.11.0", features = ["bytes", "uuid", "derive"] }
+fjall = { version = "3", default-features = false }
+anyhow = "1"
+rkyv = { version = "0.8", default-features = false, features = ["unaligned"] }
+easy_rkyv = { path = "../easy_rkyv", default-features = false, features = [
+  "debug_validate",
+  "unaligned",
+] }
+bytes = "1"
+migrateable = { path = "../migrateable", optional = true }
+log = "0.4"
+tempfile = "3"
+tar = "0.4"
+zstd = "0.13"
+fs-more = "0.8"
+fs4 = "1.1"
+bytesize = "2"
+arc-swap = "1.9.1"
+jiff = "0.2"
+uuid = { version = "1", features = ["v7", "fast-rng"] }
+charabia = { version = "0.9.9", optional = true, default-features = false }
+
+[features]
+default = ["derive", "bytes", "migrateable"]
+derive = ["fjall_expanded_derive"]
+bytes = ["fjall/bytes_1"]
+migrateable = ["dep:migrateable"]
+search = ["migrateable", "dep:charabia"]
