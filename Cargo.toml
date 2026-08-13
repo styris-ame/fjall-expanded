@@ -22,10 +22,10 @@ zstd = "0.13"
 fs-more = "0.8"
 fs4 = "1.1"
 bytesize = "2"
-arc-swap = "1.9.1"
+arc-swap = "1.9.2"
 jiff = "0.2"
 uuid = { version = "1", features = ["v7", "fast-rng"] }
-charabia = { version = "0.9.9", optional = true, default-features = false }
+charabia = { version = "0.10.0", optional = true, default-features = false }
 
 [features]
 default = ["derive", "bytes", "migrateable"]
