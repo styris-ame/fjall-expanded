@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use arc_swap::ArcSwap;
-use fjall::config::{BlockSizePolicy, CompressionPolicy, PartitioningPolicy};
+use fjall::config::{BlockSizePolicy, BloomConstructionPolicy, CompressionPolicy, FilterPolicy, FilterPolicyEntry, PartitioningPolicy};
 use fjall::{CompressionType, KvSeparationOptions};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, OwnedWriteBatch, PersistMode};
 
@@ -75,6 +75,7 @@ struct FormatFingerprint {
     data_block_size: u32,
     expect_point_read_hits: bool,
     filter_block_partitioning: Option<bool>,
+    filter_policy: Option<FilterConfig>,
     // Only whether kv separation is on: the knobs inside BlobOptions (target
     // size, threshold, compression) shape new writes only — every existing blob
     // file records its own compression and stays readable — so they may be
@@ -84,12 +85,19 @@ struct FormatFingerprint {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub enum FilterConfig {
+    Disabled,
+    BloomBitsPerKey(u8),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct SpaceOptions {
     pub max_memtable_size: u64,
     pub data_block_size: u32,
     pub manual_journal_persist: bool,
     pub expect_point_read_hits: bool,
     pub filter_block_partitioning: Option<bool>,
+    pub filter_policy: Option<FilterConfig>,
     pub blob: Option<BlobOptions>,
     pub fifo_compaction_bytes: Option<u64>,
     pub disable_compression: bool,
@@ -103,6 +111,7 @@ impl Default for SpaceOptions {
             manual_journal_persist: false,
             expect_point_read_hits: false,
             filter_block_partitioning: None,
+            filter_policy: None,
             blob: None,
             fifo_compaction_bytes: None,
             disable_compression: false,
@@ -136,6 +145,11 @@ impl SpaceOptions {
         self
     }
 
+    pub fn filter_policy(mut self, policy: FilterConfig) -> Self {
+        self.filter_policy = Some(policy);
+        self
+    }
+
     pub fn disable_compression(mut self) -> Self {
         self.disable_compression = true;
         self
@@ -162,6 +176,7 @@ impl SpaceOptions {
             data_block_size: self.data_block_size,
             expect_point_read_hits: self.expect_point_read_hits,
             filter_block_partitioning: self.filter_block_partitioning,
+            filter_policy: self.filter_policy.clone(),
             blob_enabled: self.blob.is_some(),
             disable_compression: self.disable_compression,
         }
@@ -192,6 +207,16 @@ impl SpaceOptions {
 
         if let Some(filter_block_partitioning) = self.filter_block_partitioning {
             options = options.filter_block_partitioning_policy(PartitioningPolicy::all(filter_block_partitioning));
+        }
+
+        if let Some(filter_policy) = &self.filter_policy {
+            let entry = match filter_policy {
+                FilterConfig::Disabled => FilterPolicyEntry::None,
+                FilterConfig::BloomBitsPerKey(bits) => {
+                    FilterPolicyEntry::Bloom(BloomConstructionPolicy::BitsPerKey(f32::from(*bits)))
+                }
+            };
+            options = options.filter_policy(FilterPolicy::all(entry));
         }
 
         if self.disable_compression {

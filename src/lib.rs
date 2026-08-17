@@ -42,8 +42,8 @@ pub use search::{
 pub use store_key::{SpaceKey, SpaceKeyRef};
 pub use store_space::StoreSpace;
 pub use managed_database::{
-    BACKUP_SUFFIX, BackupEntry, BackupProgress, BackupSettings, BlobOptions, DatabaseInitializer, SpaceGroup, SpaceOptions,
-    ManagedDatabase, ManagedDatabaseConfig, is_backup_archive, list_backups, namespaced, open_managed_database,
+    BACKUP_SUFFIX, BackupEntry, BackupProgress, BackupSettings, BlobOptions, DatabaseInitializer, FilterConfig, SpaceGroup,
+    SpaceOptions, ManagedDatabase, ManagedDatabaseConfig, is_backup_archive, list_backups, namespaced, open_managed_database,
     pack_prerestore_snapshot,
 };
 pub use versioned_alias_space::VersionedAliasSpace;
