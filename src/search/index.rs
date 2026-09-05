@@ -6,7 +6,7 @@ use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, OptimisticWriteTx, Slice
 
 use crate::Readable;
 
-use super::tokenizer::tokenize_counts;
+use super::tokenizer::tokenize_positions;
 
 pub(super) const SEPARATOR: u8 = 0;
 
@@ -36,25 +36,26 @@ impl Clone for Index {
 
 impl Index {
     pub(super) fn index(&self, tx: &mut OptimisticWriteTx, id_body: &[u8], content: &str, min_token_length: usize) -> Result<()> {
-        let new_counts = tokenize_counts(content, min_token_length);
+        let new_positions = tokenize_positions(content, min_token_length);
         let old_counts = self.document_counts(&*tx, id_body)?;
 
         for term in old_counts.keys() {
-            if !new_counts.contains_key(term) {
+            if !new_positions.contains_key(term) {
                 tx.remove(&self.postings, posting_key(term, id_body));
             }
         }
-        // A term still present but with a changed count needs its posting value
-        // rewritten, so write whenever the count differs (or is new).
-        for (term, count) in &new_counts {
-            if old_counts.get(term) != Some(count) {
-                tx.insert(&self.postings, posting_key(term, id_body), encode_count(*count));
-            }
+        // Postings carry positions, not just a count, so a term whose count is
+        // unchanged can still have moved. Every current term's posting is rewritten
+        // to keep its positions fresh.
+        for (term, positions) in &new_positions {
+            tx.insert(&self.postings, posting_key(term, id_body), encode_posting(positions));
         }
 
-        if new_counts.is_empty() {
+        if new_positions.is_empty() {
             tx.remove(&self.documents, id_body);
         } else {
+            let new_counts: BTreeMap<String, u32> =
+                new_positions.iter().map(|(term, positions)| (term.clone(), positions.len() as u32)).collect();
             tx.insert(&self.documents, id_body, encode_counts(&new_counts));
         }
 
@@ -78,14 +79,21 @@ impl Index {
     /// satisfy at least one to appear. Documents satisfying any negative clause
     /// are dropped.
     ///
-    /// Ranking is, in strict priority order:
-    ///   1. coverage — how many optional clauses the document matches (every
-    ///      survivor already matches all required ones, so they don't separate);
-    ///   2. length — total length of the distinct query terms it matched, so a hit
-    ///      on a long, specific word outweighs one on a short, common word;
-    ///   3. frequency — total occurrences of those terms, the last resort, so mere
-    ///      repetition only breaks ties between otherwise-equal matches;
-    ///   4. id ascending, for a stable order.
+    /// Ranking is, in priority order:
+    ///   1. coverage — how many optional clauses the document matches. A strict
+    ///      gate above the score: matching more of the requested optional words
+    ///      always wins (every survivor already matches all required clauses).
+    ///   2. relevance — an additive score summed over the matched query terms:
+    ///        * word match: `WORD_MATCH_BASE` (10) + the term's length, so any
+    ///          match is worth at least 10 and a longer, more specific word more;
+    ///        * frequency: +1 per extra occurrence of a term, capped at
+    ///          `FREQUENCY_CAP`, a mild tiebreak that can't outweigh matching a
+    ///          whole other word;
+    ///        * proximity: query terms found in order add `PROXIMITY_ADJACENT_BONUS`
+    ///          (8) minus the tokens skipped between them, so adjacency lifts
+    ///          "mckinley swab" over the same words apart or reversed, yet stays
+    ///          below a single word match so it only refines, never dominates.
+    ///   3. id ascending, for a stable order.
     pub(super) fn search_scored(
         &self,
         tx: &impl Readable,
@@ -125,27 +133,32 @@ impl Index {
             return Ok(Vec::new());
         }
 
-        // Frequency is the lowest-priority tiebreak, so it's read per surviving
-        // candidate rather than by rescanning whole posting lists: a popular term
-        // elsewhere never costs us, and coverage has already done the real sorting.
-        let positive: BTreeSet<&String> = required.iter().chain(optional).flatten().collect();
-        let mut ranked: Vec<(Vec<u8>, u32, u64, u64)> = Vec::with_capacity(coverage.len());
+        // Relevance is computed per surviving candidate rather than by rescanning
+        // whole posting lists: coverage has already done the coarse sorting, and each
+        // candidate's postings are a handful of point reads. Terms are visited in
+        // query order so proximity can score in-order closeness.
+        let ordered = ordered_terms(required, optional);
+        let mut ranked: Vec<(Vec<u8>, u32, u64)> = Vec::with_capacity(coverage.len());
         for (id, hits) in coverage {
-            let mut length = 0u64;
-            let mut frequency = 0u64;
-            for term in &positive {
-                if let Some(value) = tx.get(&self.postings, posting_key(term, &id))? {
-                    length += term.len() as u64;
-                    frequency += decode_count(value.as_ref()) as u64;
+            let mut relevance = 0u64;
+            let mut positions_in_order: Vec<Vec<u32>> = Vec::with_capacity(ordered.len());
+            for term in &ordered {
+                match tx.get(&self.postings, posting_key(term, &id))? {
+                    Some(value) => {
+                        let count = decode_count(value.as_ref());
+                        relevance += WORD_MATCH_BASE + term.len() as u64;
+                        relevance += u64::from(count.saturating_sub(1).min(FREQUENCY_CAP));
+                        positions_in_order.push(decode_positions(value.as_ref()));
+                    }
+                    None => positions_in_order.push(Vec::new()),
                 }
             }
-            ranked.push((id, hits, length, frequency));
+            relevance += proximity_boost(&positions_in_order);
+            ranked.push((id, hits, relevance));
         }
 
-        ranked.sort_unstable_by(|a, b| {
-            b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)).then_with(|| b.3.cmp(&a.3)).then_with(|| a.0.cmp(&b.0))
-        });
-        Ok(ranked.into_iter().map(|(id, _, _, _)| Slice::from(id)).collect())
+        ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)).then_with(|| a.0.cmp(&b.0)));
+        Ok(ranked.into_iter().map(|(id, ..)| Slice::from(id)).collect())
     }
 
     /// Every id body whose document contains all of `terms`, sorted ascending,
@@ -285,21 +298,113 @@ impl TermCursor {
     }
 }
 
-/// Posting value: the term's occurrence count in that document as a varint.
+/// The distinct positive query terms in query order (required clauses first,
+/// then optional), first occurrence wins. Order matters so proximity can score
+/// terms in the sequence the user typed them.
+fn ordered_terms(required: &[Vec<String>], optional: &[Vec<String>]) -> Vec<String> {
+    let mut seen = HashMap::new();
+    let mut ordered = Vec::new();
+    for term in required.iter().chain(optional).flatten() {
+        if seen.insert(term.clone(), ()).is_none() {
+            ordered.push(term.clone());
+        }
+    }
+    ordered
+}
+
+/// Points for matching a query term, before its length is added. Every match is
+/// therefore worth at least this much, so no proximity or frequency bonus can let
+/// a document win without matching more (or longer) query words.
+const WORD_MATCH_BASE: u64 = 10;
+
+/// Ceiling on the extra-occurrence (frequency) bonus a single term contributes, so
+/// keyword stuffing can nudge ties but never dominate distinct word matches.
+const FREQUENCY_CAP: u32 = 10;
+
+/// Adjacency bonus for two query terms found in order with nothing between them;
+/// each skipped token drops the bonus by one, to a floor of zero. Kept below the
+/// minimum word match (`WORD_MATCH_BASE` + shortest token) so proximity only
+/// refines the ranking of equally-matched documents.
+const PROXIMITY_ADJACENT_BONUS: u64 = 8;
+
+/// In-order closeness score for one document, given each ordered query term's
+/// positions in it (empty when the term is absent). Anchored at the first present
+/// term's earliest position, each following term is matched to its earliest
+/// position after the anchor; the bonus decays with the tokens skipped and the
+/// anchor advances. A term with no later position (or an absent term) breaks the
+/// chain, which re-anchors at that term's earliest position. This is purely
+/// additive on top of the base score, so reversed or scattered matches simply
+/// earn no bonus rather than being penalized.
+fn proximity_boost(positions_in_order: &[Vec<u32>]) -> u64 {
+    let mut boost = 0u64;
+    let mut anchor: Option<u32> = None;
+    for positions in positions_in_order {
+        let Some(&first) = positions.first() else {
+            anchor = None;
+            continue;
+        };
+        match anchor {
+            None => anchor = Some(first),
+            Some(previous) => match positions.iter().copied().find(|&pos| pos > previous) {
+                Some(next) => {
+                    let skipped = u64::from(next - previous - 1);
+                    boost += PROXIMITY_ADJACENT_BONUS.saturating_sub(skipped);
+                    anchor = Some(next);
+                }
+                None => anchor = Some(first),
+            },
+        }
+    }
+    boost
+}
+
+/// Posting value: `varint(count) ++ delta-encoded ascending positions`. The
+/// leading count keeps [`decode_count`] (and legacy count-only postings) valid;
+/// positions follow for proximity scoring.
+pub(super) fn encode_posting(positions: &[u32]) -> Slice {
+    let mut buf = Vec::with_capacity(positions.len() + 1);
+    write_varint(&mut buf, positions.len() as u64);
+    let mut previous = 0u32;
+    for &position in positions {
+        write_varint(&mut buf, u64::from(position - previous));
+        previous = position;
+    }
+    Slice::from(buf)
+}
+
+/// Posting value: the term's occurrence count in that document as a varint,
+/// still used by the version-migration path which has no positions to carry.
 pub(super) fn encode_count(count: u32) -> Slice {
     let mut buf = Vec::with_capacity(5);
     write_varint(&mut buf, count as u64);
     Slice::from(buf)
 }
 
-/// Decodes a posting value back to a count. Legacy empty postings (written
-/// before counts existed) decode as 1.
+/// Decodes a posting value back to a count (its leading varint). Legacy empty
+/// postings (written before counts existed) decode as 1.
 pub(super) fn decode_count(bytes: &[u8]) -> u32 {
     let mut pos = 0;
     match read_varint(bytes, &mut pos) {
         Some(value) => value.min(u32::MAX as u64) as u32,
         None => 1,
     }
+}
+
+/// Decodes a posting value's positions. The leading count is skipped, then the
+/// delta-encoded positions are accumulated. Legacy count-only postings have no
+/// deltas and yield an empty list (no proximity contribution until reindexed).
+pub(super) fn decode_positions(bytes: &[u8]) -> Vec<u32> {
+    let mut pos = 0;
+    if read_varint(bytes, &mut pos).is_none() {
+        return Vec::new();
+    }
+    let mut positions = Vec::new();
+    let mut current = 0u64;
+    while let Some(delta) = read_varint(bytes, &mut pos) {
+        current += delta;
+        positions.push(current.min(u64::from(u32::MAX)) as u32);
+    }
+    positions
 }
 
 /// Documents value: each `(term, count)` as `varint(len) ++ term ++ varint(count)`,

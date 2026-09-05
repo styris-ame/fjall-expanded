@@ -31,6 +31,24 @@ pub fn tokenize_counts(text: &str, min_length: usize) -> BTreeMap<String, u32> {
     counts
 }
 
+/// Like [`tokenize_counts`] but keeps each lemma's ordered positions (0-based
+/// index among the length-passing word tokens), so the index can score in-order
+/// term proximity. Positions per lemma are ascending; kept tokens are numbered
+/// consecutively, so two words written next to each other are one apart.
+pub fn tokenize_positions(text: &str, min_length: usize) -> BTreeMap<String, Vec<u32>> {
+    let mut positions: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+    let mut index = 0u32;
+    for token in text.tokenize().filter(|token| token.is_word()) {
+        let lemma = token.lemma();
+        if lemma.len() < min_length {
+            continue;
+        }
+        positions.entry(lemma.to_string()).or_default().push(index);
+        index = index.saturating_add(1);
+    }
+    positions
+}
+
 /// A word token's normalized lemma alongside its byte span in the source text,
 /// for callers that need to highlight matches in the original string.
 pub struct WordSpan {
