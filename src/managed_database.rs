@@ -17,6 +17,11 @@ use easy_rkyv::Rkyv;
 use crate::schema_map_space::SCHEMA_MAP_KEYSPACE;
 use crate::{Readable, SchemaMapSpace};
 
+/// A space's data migration, deferred by `stage_open` and run by the framework
+/// only after every space has opened and validated. Kept boxed so migrations for
+/// differently-typed spaces can queue together.
+pub(crate) type DeferredMigration = Box<dyn FnOnce() -> Result<()>>;
+
 const REGISTRY_KEYSPACE: &str = "__fjall_expanded_registry";
 
 const BACKUP_BATCH_BYTES: usize = 1024 * 1024 * 16;
@@ -489,6 +494,7 @@ pub struct DatabaseInitializer {
     registry: OptimisticTxKeyspace,
     previous: HashMap<String, Vec<u8>>,
     opened: HashSet<String>,
+    pending_migrations: Vec<DeferredMigration>,
     config: ManagedDatabaseConfig,
 }
 
@@ -514,8 +520,26 @@ impl DatabaseInitializer {
             registry,
             previous,
             opened: HashSet::new(),
+            pending_migrations: Vec::new(),
             config,
         })
+    }
+
+    /// Queues a migration to run once every space has validated. `stage_open` uses
+    /// this for a space's own data migration, and a caller can add its own follow-up
+    /// migrations (for example a value-level rewrite layered on a space). Queued
+    /// closures run in registration order.
+    pub fn defer_migration(&mut self, migration: impl FnOnce() -> Result<()> + 'static) {
+        self.pending_migrations.push(Box::new(migration));
+    }
+
+    /// Runs and clears every queued migration, in order. Called by the framework
+    /// after validation, so a schema mismatch aborts before any of these run.
+    fn run_pending_migrations(&mut self) -> Result<()> {
+        for migration in std::mem::take(&mut self.pending_migrations) {
+            migration()?;
+        }
+        Ok(())
     }
 
     fn finish<T>(self, state: T) -> Result<ManagedDatabase<T>> {
@@ -642,6 +666,12 @@ impl SpaceGroup<'_> {
     pub(crate) fn open_keyspace(&mut self, full_name: String, options: SpaceOptions) -> Result<OptimisticTxKeyspace> {
         self.initializer.open_keyspace(full_name, options)
     }
+
+    /// Queues a migration to run after every space has validated. See
+    /// [`DatabaseInitializer::defer_migration`].
+    pub fn defer_migration(&mut self, migration: impl FnOnce() -> Result<()> + 'static) {
+        self.initializer.defer_migration(migration);
+    }
 }
 
 /// A live database produced by [`open_managed_database`], carrying the value `T`
@@ -698,8 +728,25 @@ pub fn open_managed_database<T>(
     config: ManagedDatabaseConfig,
     init: impl FnOnce(&mut DatabaseInitializer) -> Result<T>,
 ) -> Result<ManagedDatabase<T>> {
+    open_managed_database_with(config, init, || Ok(()))
+}
+
+/// Like [`open_managed_database`], but calls `on_validated` at the point where
+/// every space has opened and validated its schema yet nothing has been
+/// migrated. That is the last instant a rollback is free: a schema mismatch
+/// surfaces from `init` before `on_validated` runs and leaves the store
+/// untouched, while the deferred migrations run only after it returns. A
+/// supervised restart can hook this to signal "the new binary is sound" before
+/// the store is rewritten.
+pub fn open_managed_database_with<T>(
+    config: ManagedDatabaseConfig,
+    init: impl FnOnce(&mut DatabaseInitializer) -> Result<T>,
+    on_validated: impl FnOnce() -> Result<()>,
+) -> Result<ManagedDatabase<T>> {
     let mut initializer = DatabaseInitializer::open(config)?;
     let state = init(&mut initializer)?;
+    on_validated()?;
+    initializer.run_pending_migrations()?;
     initializer.finish(state)
 }
 

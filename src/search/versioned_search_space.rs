@@ -7,7 +7,8 @@ use log::info;
 use migrateable::{MigrateDataKind, Migrateable, Type};
 
 use crate::key_slice::ToKeySlice;
-use crate::schema_map_space::{SpaceSchema, SpaceSchemaHandle};
+use crate::schema_map_space::{SpaceSchema, ValidatedSchema};
+use crate::SchemaMapSpace;
 use crate::store_key::SpaceKey;
 use crate::managed_database::{SpaceGroup, SpaceOptions};
 use crate::{IterExtensions, KeySource, Readable};
@@ -55,11 +56,25 @@ where
     }
 }
 
-impl<K: Migrateable> VersionedSearchSpace<K>
+impl<K: Migrateable + 'static> VersionedSearchSpace<K>
 where
     K::Current: KeySource<K::Current>,
 {
-    pub fn open_and_migrate(group: &mut SpaceGroup, options: SpaceOptions) -> Result<Self> {
+    /// Opens the postings and documents keyspaces and validates the stored
+    /// schema against the current key type, returning the live space with its
+    /// data migration queued to run after every space has validated. Validation
+    /// reads only, so a schema mismatch here leaves the store untouched.
+    pub fn stage_open(group: &mut SpaceGroup, options: SpaceOptions) -> Result<Self> {
+        let (space, documents_name, validated, schema_map) = Self::open_and_validate(group, options)?;
+        let migrator = space.clone();
+        group.defer_migration(move || migrator.run_migration(&documents_name, &validated, &schema_map));
+        Ok(space)
+    }
+
+    fn open_and_validate(
+        group: &mut SpaceGroup,
+        options: SpaceOptions,
+    ) -> Result<(Self, String, ValidatedSchema<K, SearchValue>, SchemaMapSpace)> {
         if K::CURRENT_DATA_KIND != MigrateDataKind::Key && K::CURRENT_DATA_KIND != MigrateDataKind::Bytes {
             return Err(anyhow!("Migrateable keys for `VersionedSearchSpace` must use the `Type` or `KeyType` data kind"));
         }
@@ -70,7 +85,7 @@ where
         let documents = group.open_keyspace(documents_name.clone(), options)?;
         let database = group.database().clone();
 
-        let result = Self {
+        let space = Self {
             index: Index {
                 postings,
                 documents,
@@ -80,14 +95,23 @@ where
             _marker: PhantomData,
         };
 
-        let schema_handle = group.schema_map().check_space_schema_and_insert_if_empty::<K, SearchValue>(&documents_name)?;
-        result.migrate(&documents_name, &schema_handle)?;
-        schema_handle.update_space_schema(
-            &documents_name,
-            &SpaceSchema::from_migrateables(K::iter().collect(), SearchValue::iter().collect()),
-        )?;
+        let validated = group.schema_map().check_space_schema_and_insert_if_empty::<K, SearchValue>(&documents_name)?;
+        let schema_map = group.schema_map().clone();
+        Ok((space, documents_name, validated, schema_map))
+    }
 
-        Ok(result)
+    fn run_migration(
+        &self,
+        documents_name: &str,
+        validated: &ValidatedSchema<K, SearchValue>,
+        schema_map: &SchemaMapSpace,
+    ) -> Result<()> {
+        self.migrate(documents_name, validated)?;
+        schema_map.write_space_schema_if_changed(
+            documents_name,
+            &validated.schema,
+            &SpaceSchema::from_migrateables(K::iter().collect(), SearchValue::iter().collect()),
+        )
     }
 
     pub fn min_token_length(mut self, length: usize) -> Self {
@@ -132,11 +156,11 @@ where
         id
     }
 
-    fn migrate(&self, space_name: &str, schema: &SpaceSchemaHandle<'_, K, SearchValue>) -> Result<()> {
+    fn migrate(&self, space_name: &str, schema: &ValidatedSchema<K, SearchValue>) -> Result<()> {
         const BATCH_SIZE: usize = 1024 * 1024 * 64;
 
-        for (key_version, _) in schema.schema().key_schema.iter() {
-            if key_version.to_u8() >= K::CURRENT_VERSION || key_version.to_u8() < schema.stored_key_version() {
+        for (key_version, _) in schema.schema.key_schema.iter() {
+            if key_version.to_u8() >= K::CURRENT_VERSION || key_version.to_u8() < schema.stored_key_version {
                 continue;
             }
 

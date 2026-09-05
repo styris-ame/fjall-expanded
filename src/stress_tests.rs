@@ -101,7 +101,7 @@ fn stress_staleness_deletions() -> Result<()> {
             let mut spaces: Vec<VersionedRkyvSpace<StressKey, StressVal>> = Vec::new();
             for i in 0..TOTAL {
                 let mut group = init.group(ns(i));
-                spaces.push(VersionedRkyvSpace::open_and_migrate(&mut group, "data", SpaceOptions::default())?);
+                spaces.push(VersionedRkyvSpace::stage_open(&mut group, "data", SpaceOptions::default())?);
             }
             Ok(spaces)
         })?;
@@ -128,7 +128,7 @@ fn stress_staleness_deletions() -> Result<()> {
         let mut spaces: Vec<VersionedRkyvSpace<StressKey, StressVal>> = Vec::new();
         for i in 0..KEEP {
             let mut group = init.group(ns(i));
-            spaces.push(VersionedRkyvSpace::open_and_migrate(&mut group, "data", SpaceOptions::default())?);
+            spaces.push(VersionedRkyvSpace::stage_open(&mut group, "data", SpaceOptions::default())?);
         }
         Ok(spaces)
     })?;
@@ -206,7 +206,7 @@ fn stress_backup_parity() -> Result<()> {
         let mut spaces: Vec<VersionedRkyvSpace<StressKey, StressVal>> = Vec::new();
         for i in 0..SPACES {
             let mut group = init.group(ns(i));
-            spaces.push(VersionedRkyvSpace::open_and_migrate(&mut group, "data", SpaceOptions::default())?);
+            spaces.push(VersionedRkyvSpace::stage_open(&mut group, "data", SpaceOptions::default())?);
         }
         Ok(spaces)
     })?;
@@ -291,7 +291,7 @@ fn stress_data_migration() -> Result<()> {
             let mut spaces: Vec<VersionedRkyvSpace<MigKey, FileValV1>> = Vec::new();
             for i in 0..SPACES {
                 let mut group = init.group(ns(i));
-                spaces.push(VersionedRkyvSpace::open_and_migrate(&mut group, "data", SpaceOptions::default())?);
+                spaces.push(VersionedRkyvSpace::stage_open(&mut group, "data", SpaceOptions::default())?);
             }
             Ok(spaces)
         })?;
@@ -318,7 +318,7 @@ fn stress_data_migration() -> Result<()> {
         let mut spaces: Vec<VersionedRkyvSpace<MigKey, FileValV2>> = Vec::new();
         for i in 0..SPACES {
             let mut group = init.group(ns(i));
-            spaces.push(VersionedRkyvSpace::open_and_migrate(&mut group, "data", SpaceOptions::default())?);
+            spaces.push(VersionedRkyvSpace::stage_open(&mut group, "data", SpaceOptions::default())?);
         }
         Ok(spaces)
     })?;

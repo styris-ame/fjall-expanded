@@ -9,8 +9,9 @@ use migrateable::MigrateDataKind;
 use migrateable::Migrateable;
 
 use crate::DataGuard;
-use crate::schema_map_space::{SpaceSchema, SpaceSchemaHandle};
+use crate::schema_map_space::{SpaceSchema, ValidatedSchema};
 use crate::versioned_key::{VersionedKey, make_versioned_prefix};
+use crate::SchemaMapSpace;
 use crate::{ReturnType, versioned_key_slice::ToVersionedKeySlice};
 
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, OptimisticWriteTx, OwnedWriteBatch};
@@ -50,12 +51,27 @@ where
 
 impl<K, V> VersionedStoreSpace<K, V>
 where
-    K: Migrateable,
+    K: Migrateable + 'static,
     K::Current: KeySource<K::Current>,
-    V: Migrateable,
+    V: Migrateable + 'static,
     V::Current: TryFrom<Slice> + TryInto<Slice>,
 {
-    pub fn open_and_migrate(group: &mut SpaceGroup, name: impl AsRef<str>, options: SpaceOptions) -> Result<Self> {
+    /// Opens the keyspace and validates its stored schema against the current
+    /// types, returning the live space with its data migration queued to run
+    /// after every space has validated. Validation reads only, so a schema
+    /// mismatch here leaves the store untouched.
+    pub fn stage_open(group: &mut SpaceGroup, name: impl AsRef<str>, options: SpaceOptions) -> Result<Self> {
+        let (space, full_name, validated, schema_map) = Self::open_and_validate(group, name, options)?;
+        let migrator = space.clone();
+        group.defer_migration(move || migrator.run_migration(&full_name, &validated, &schema_map));
+        Ok(space)
+    }
+
+    fn open_and_validate(
+        group: &mut SpaceGroup,
+        name: impl AsRef<str>,
+        options: SpaceOptions,
+    ) -> Result<(Self, String, ValidatedSchema<K, V>, SchemaMapSpace)> {
         if K::CURRENT_DATA_KIND != MigrateDataKind::Key && K::CURRENT_DATA_KIND != MigrateDataKind::Bytes {
             return Err(anyhow!("Migrateable keys for `VersionedStoreSpace` must use the `Type` or `KeyType` data kind"));
         }
@@ -64,26 +80,30 @@ where
         let keyspace = group.open_keyspace(full_name.clone(), options)?;
         let database = group.database().clone();
 
-        let result = Self {
+        let space = Self {
             inner: keyspace,
             database,
             _marker: PhantomData,
         };
-        let schema_handle = group.schema_map().check_space_schema_and_insert_if_empty::<K, V>(&full_name)?;
-
-        result.migrate(&full_name, &schema_handle)?;
-
-        schema_handle
-            .update_space_schema(&full_name, &SpaceSchema::from_migrateables(K::iter().collect(), V::iter().collect()))?;
-
-        Ok(result)
+        let validated = group.schema_map().check_space_schema_and_insert_if_empty::<K, V>(&full_name)?;
+        let schema_map = group.schema_map().clone();
+        Ok((space, full_name, validated, schema_map))
     }
 
-    fn migrate(&self, space_name: &str, schema: &SpaceSchemaHandle<'_, K, V>) -> Result<()> {
+    fn run_migration(&self, full_name: &str, validated: &ValidatedSchema<K, V>, schema_map: &SchemaMapSpace) -> Result<()> {
+        self.migrate(full_name, validated)?;
+        schema_map.write_space_schema_if_changed(
+            full_name,
+            &validated.schema,
+            &SpaceSchema::from_migrateables(K::iter().collect(), V::iter().collect()),
+        )
+    }
+
+    fn migrate(&self, space_name: &str, schema: &ValidatedSchema<K, V>) -> Result<()> {
         const BATCH_SIZE: usize = 1024 * 1024 * 64;
 
-        for (key_version, _) in schema.schema().key_schema.iter() {
-            if key_version.to_u8() >= K::CURRENT_VERSION || key_version.to_u8() < schema.stored_key_version() {
+        for (key_version, _) in schema.schema.key_schema.iter() {
+            if key_version.to_u8() >= K::CURRENT_VERSION || key_version.to_u8() < schema.stored_key_version {
                 continue;
             }
 
@@ -135,8 +155,8 @@ where
             }
         }
 
-        for (value_version, _) in schema.schema().value_schema.iter() {
-            if value_version.to_u8() >= V::CURRENT_VERSION || value_version.to_u8() < schema.stored_value_version() {
+        for (value_version, _) in schema.schema.value_schema.iter() {
+            if value_version.to_u8() >= V::CURRENT_VERSION || value_version.to_u8() < schema.stored_value_version {
                 continue;
             }
 

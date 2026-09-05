@@ -134,6 +134,13 @@ where
             _marker: PhantomData,
         })
     }
+
+    /// Opens the keyspace. An unversioned store has nothing to migrate, so this is
+    /// just [`open`](Self::open) under the name its versioned siblings use, letting
+    /// a whole store be declared with one consistent call.
+    pub fn stage_open(group: &mut SpaceGroup, name: impl AsRef<str>, options: SpaceOptions) -> Result<Self> {
+        Self::open(group, name, options)
+    }
 }
 
 // ── Read methods (Readable + IterExtensions mirrors) ───────────────────

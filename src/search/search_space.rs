@@ -52,6 +52,13 @@ impl<K: KeySource<K>> SearchSpace<K> {
         })
     }
 
+    /// Opens the backing keyspaces. An unversioned search index has nothing to
+    /// migrate, so this is just [`open`](Self::open) under the name its versioned
+    /// siblings use, letting a whole store be declared with one consistent call.
+    pub fn stage_open(group: &mut SpaceGroup, options: SpaceOptions) -> Result<Self> {
+        Self::open(group, options)
+    }
+
     pub fn min_token_length(mut self, length: usize) -> Self {
         self.min_token_length = length;
         self

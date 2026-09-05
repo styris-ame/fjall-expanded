@@ -9,6 +9,7 @@ use crate::{IterExtensions, SpaceKey, ToKeySlice, encode_key_prefix};
 
 pub(crate) const SCHEMA_MAP_KEYSPACE: &str = "__fjall_expanded_migrateable_schema";
 
+#[derive(Clone)]
 pub struct SchemaMapSpace {
     inner: OptimisticTxKeyspace,
     database: OptimisticTxDatabase,
@@ -54,47 +55,26 @@ impl<K: Migrateable, V: Migrateable> SpaceSchema<K, V> {
     }
 }
 
-pub(crate) struct SpaceSchemaHandle<'a, K: Migrateable, V: Migrateable> {
-    space: &'a SchemaMapSpace,
-    schema: SpaceSchema<K, V>,
-    highest_key_version: u8,
-    highest_value_version: u8,
+/// The stored schema of a space that has passed validation, owned so it can
+/// outlive the borrow of the [`SchemaMapSpace`] and travel into a deferred
+/// migration. The two version fields are the highest key and value versions
+/// found on disk, which bound how far back a migration has to scan.
+pub(crate) struct ValidatedSchema<K: Migrateable, V: Migrateable> {
+    pub schema: SpaceSchema<K, V>,
+    pub stored_key_version: u8,
+    pub stored_value_version: u8,
 }
 
-impl<'a, K: Migrateable, V: Migrateable> SpaceSchemaHandle<'a, K, V> {
-    pub fn new(space: &'a SchemaMapSpace, schema: SpaceSchema<K, V>) -> Self {
-        let highest_key_version = schema.key_schema.iter().map(|(k, _)| k.to_u8()).max().unwrap_or(0);
-        let highest_value_version = schema.value_schema.iter().map(|(v, _)| v.to_u8()).max().unwrap_or(0);
+impl<K: Migrateable, V: Migrateable> ValidatedSchema<K, V> {
+    fn new(schema: SpaceSchema<K, V>) -> Self {
+        let stored_key_version = schema.key_schema.iter().map(|(k, _)| k.to_u8()).max().unwrap_or(0);
+        let stored_value_version = schema.value_schema.iter().map(|(v, _)| v.to_u8()).max().unwrap_or(0);
 
         Self {
-            space,
             schema,
-            highest_key_version,
-            highest_value_version,
+            stored_key_version,
+            stored_value_version,
         }
-    }
-
-    pub fn stored_key_version(&self) -> u8 {
-        self.highest_key_version
-    }
-
-    pub fn stored_value_version(&self) -> u8 {
-        self.highest_value_version
-    }
-
-    pub fn schema(&self) -> &SpaceSchema<K, V> {
-        &self.schema
-    }
-
-    pub fn update_space_schema(self, key: &str, schema: &SpaceSchema<K, V>) -> anyhow::Result<()> {
-        if self.schema.key_schema.iter().map(|(v, h)| (v.to_u8(), h)).collect::<Vec<_>>()
-            != schema.key_schema.iter().map(|(v, h)| (v.to_u8(), h)).collect::<Vec<_>>()
-            || self.schema.value_schema.iter().map(|(v, h)| (v.to_u8(), h)).collect::<Vec<_>>()
-                != schema.value_schema.iter().map(|(v, h)| (v.to_u8(), h)).collect::<Vec<_>>()
-        {
-            self.space.update_space_schema(key, schema)?;
-        }
-        Ok(())
     }
 }
 
@@ -117,7 +97,7 @@ impl SchemaMapSpace {
     pub(crate) fn check_space_schema_and_insert_if_empty<K: Migrateable, V: Migrateable>(
         &self,
         key: &str,
-    ) -> anyhow::Result<SpaceSchemaHandle<'_, K, V>> {
+    ) -> anyhow::Result<ValidatedSchema<K, V>> {
         let mut existing_key_schema = Vec::<(K, u128)>::new();
         let mut existing_value_schema = Vec::<(V, u128)>::new();
 
@@ -221,7 +201,26 @@ impl SchemaMapSpace {
         }
 
         tx.commit()??;
-        Ok(SpaceSchemaHandle::new(self, SpaceSchema::new(existing_key_schema, existing_value_schema)))
+        Ok(ValidatedSchema::new(SpaceSchema::new(existing_key_schema, existing_value_schema)))
+    }
+
+    /// Records `next` as the space's schema, but only when it differs from
+    /// `previous`, so a reopen that changed nothing writes nothing.
+    pub(crate) fn write_space_schema_if_changed<K: Migrateable, V: Migrateable>(
+        &self,
+        key: &str,
+        previous: &SpaceSchema<K, V>,
+        next: &SpaceSchema<K, V>,
+    ) -> anyhow::Result<()> {
+        let previous_key = previous.key_schema.iter().map(|(v, h)| (v.to_u8(), h)).collect::<Vec<_>>();
+        let next_key = next.key_schema.iter().map(|(v, h)| (v.to_u8(), h)).collect::<Vec<_>>();
+        let previous_value = previous.value_schema.iter().map(|(v, h)| (v.to_u8(), h)).collect::<Vec<_>>();
+        let next_value = next.value_schema.iter().map(|(v, h)| (v.to_u8(), h)).collect::<Vec<_>>();
+
+        if previous_key != next_key || previous_value != next_value {
+            self.update_space_schema(key, next)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn remove_space(&self, key: &str) -> anyhow::Result<()> {

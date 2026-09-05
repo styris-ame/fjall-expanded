@@ -9,7 +9,8 @@ use log::{error, info, warn};
 use migrateable::{MigrateDataKind, Migrateable, Type};
 
 use crate::key_slice::ToKeySlice;
-use crate::schema_map_space::{SpaceSchema, SpaceSchemaHandle};
+use crate::schema_map_space::{SpaceSchema, ValidatedSchema};
+use crate::SchemaMapSpace;
 use crate::managed_database::{SpaceGroup, SpaceOptions};
 use crate::{BlobOptions, IterExtensions, KeySource, Readable};
 
@@ -141,7 +142,7 @@ impl BlobStorage {
 /// marker, and become visible atomically when [`commit`](Self::commit) runs in a
 /// caller transaction. Dropping a [`LargeBlobWriter`] or an uncommitted
 /// [`StagedBlob`] deletes its chunks immediately; markers that survive a crash
-/// are swept on the next [`open_and_migrate`](Self::open_and_migrate).
+/// are swept on the next [`stage_open`](Self::stage_open).
 pub struct LargeBlobSpace<K: Migrateable>
 where
     K::Current: KeySource<K::Current>,
@@ -166,24 +167,38 @@ where
     }
 }
 
-impl<K: Migrateable> LargeBlobSpace<K>
+impl<K: Migrateable + 'static> LargeBlobSpace<K>
 where
     K::Current: KeySource<K::Current>,
 {
     /// Opens the three backing keyspaces (`{name}.manifests`, `{name}.chunks`,
-    /// `{name}.staging`), migrates manifest keys stored under older key versions,
-    /// and sweeps chunks orphaned by a crash mid-upload.
+    /// `{name}.staging`) and validates the manifests' stored schema against the
+    /// current key type, returning the live space with its manifest migration and
+    /// orphan sweep queued to run after every space has validated. Validation
+    /// reads only, so a schema mismatch here leaves the store untouched.
     ///
     /// `options` applies to the chunks keyspace; kv separation is enabled there
     /// by default since chunks are the large payloads. Manifests and staging
     /// markers are small and use default options. `chunk_size` only affects new
     /// writes: each manifest records the size its blob was written with.
-    pub fn open_and_migrate(
+    pub fn stage_open(
+        group: &mut SpaceGroup,
+        name: impl AsRef<str>,
+        options: SpaceOptions,
+        chunk_size: u32,
+    ) -> Result<Self> {
+        let (space, manifests_name, validated, schema_map) = Self::open_and_validate(group, name, options, chunk_size)?;
+        let migrator = space.clone();
+        group.defer_migration(move || migrator.run_migration(&manifests_name, &validated, &schema_map));
+        Ok(space)
+    }
+
+    fn open_and_validate(
         group: &mut SpaceGroup,
         name: impl AsRef<str>,
         mut options: SpaceOptions,
         chunk_size: u32,
-    ) -> Result<Self> {
+    ) -> Result<(Self, String, ValidatedSchema<K, LargeBlobValue>, SchemaMapSpace)> {
         if K::CURRENT_DATA_KIND != MigrateDataKind::Key && K::CURRENT_DATA_KIND != MigrateDataKind::Bytes {
             return Err(anyhow!("Migrateable keys for `LargeBlobSpace` must use the `Type` or `KeyType` data kind"));
         }
@@ -202,7 +217,7 @@ where
         let staging = group.open_keyspace(group.full_name(format!("{name}.staging")), SpaceOptions::default())?;
         let database = group.database().clone();
 
-        let result = Self {
+        let space = Self {
             manifests,
             storage: BlobStorage {
                 chunks,
@@ -214,23 +229,31 @@ where
             _marker: PhantomData,
         };
 
-        let schema_handle = group.schema_map().check_space_schema_and_insert_if_empty::<K, LargeBlobValue>(&manifests_name)?;
-        result.migrate(&manifests_name, &schema_handle)?;
-        schema_handle.update_space_schema(
-            &manifests_name,
-            &SpaceSchema::from_migrateables(K::iter().collect(), LargeBlobValue::iter().collect()),
-        )?;
-
-        result.cleanup_orphans(&manifests_name)?;
-
-        Ok(result)
+        let validated = group.schema_map().check_space_schema_and_insert_if_empty::<K, LargeBlobValue>(&manifests_name)?;
+        let schema_map = group.schema_map().clone();
+        Ok((space, manifests_name, validated, schema_map))
     }
 
-    fn migrate(&self, space_name: &str, schema: &SpaceSchemaHandle<'_, K, LargeBlobValue>) -> Result<()> {
+    fn run_migration(
+        &self,
+        manifests_name: &str,
+        validated: &ValidatedSchema<K, LargeBlobValue>,
+        schema_map: &SchemaMapSpace,
+    ) -> Result<()> {
+        self.migrate(manifests_name, validated)?;
+        schema_map.write_space_schema_if_changed(
+            manifests_name,
+            &validated.schema,
+            &SpaceSchema::from_migrateables(K::iter().collect(), LargeBlobValue::iter().collect()),
+        )?;
+        self.cleanup_orphans(manifests_name)
+    }
+
+    fn migrate(&self, space_name: &str, schema: &ValidatedSchema<K, LargeBlobValue>) -> Result<()> {
         let database = &self.storage.database;
 
-        for (key_version, _) in schema.schema().key_schema.iter() {
-            if key_version.to_u8() >= K::CURRENT_VERSION || key_version.to_u8() < schema.stored_key_version() {
+        for (key_version, _) in schema.schema.key_schema.iter() {
+            if key_version.to_u8() >= K::CURRENT_VERSION || key_version.to_u8() < schema.stored_key_version {
                 continue;
             }
 
@@ -684,7 +707,7 @@ mod tests {
     fn open_space(path: &std::path::Path) -> Result<crate::ManagedDatabase<LargeBlobSpace<TestBlobKey>>> {
         open_managed_database(ManagedDatabaseConfig::new(path), |init| {
             let mut group = init.group("test");
-            LargeBlobSpace::open_and_migrate(&mut group, "blobs", SpaceOptions::default(), CHUNK)
+            LargeBlobSpace::stage_open(&mut group, "blobs", SpaceOptions::default(), CHUNK)
         })
     }
 
@@ -846,8 +869,8 @@ mod tests {
         let db = open_managed_database(ManagedDatabaseConfig::new(dir.path()), |init| {
             let mut group = init.group("test");
             Ok((
-                LargeBlobSpace::<TestBlobKey>::open_and_migrate(&mut group, "a", SpaceOptions::default(), CHUNK)?,
-                LargeBlobSpace::<TestBlobKey>::open_and_migrate(&mut group, "b", SpaceOptions::default(), CHUNK)?,
+                LargeBlobSpace::<TestBlobKey>::stage_open(&mut group, "a", SpaceOptions::default(), CHUNK)?,
+                LargeBlobSpace::<TestBlobKey>::stage_open(&mut group, "b", SpaceOptions::default(), CHUNK)?,
             ))
         })?;
         let (space_a, space_b) = db.state();

@@ -44,7 +44,7 @@ pub use store_space::StoreSpace;
 pub use managed_database::{
     BACKUP_SUFFIX, BackupEntry, BackupProgress, BackupSettings, BlobOptions, DatabaseInitializer, FilterConfig, SpaceGroup,
     SpaceOptions, ManagedDatabase, ManagedDatabaseConfig, is_backup_archive, list_backups, namespaced, open_managed_database,
-    pack_prerestore_snapshot,
+    open_managed_database_with, pack_prerestore_snapshot,
 };
 pub use versioned_alias_space::VersionedAliasSpace;
 pub use versioned_key::{VersionedKey, VersionedKeyRef};
