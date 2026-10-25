@@ -231,6 +231,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 [[package]]
 name = "easy_rkyv"
 version = "0.1.0"
+source = "git+https://github.com/styris-ame/easy-rkyv#1383ca5ff1869c80d2c217b7ec65ba169d036440"
 dependencies = [
  "anyhow",
  "bytes",
@@ -645,6 +646,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "migrateable"
 version = "0.1.0"
+source = "git+https://github.com/styris-ame/migrateable-rs#d3861fdd98c6f1891297d057a6d402c3f292ad56"
 dependencies = [
  "anyhow",
  "fjall",
@@ -656,6 +658,7 @@ dependencies = [
 [[package]]
 name = "migrateable_derive"
 version = "0.1.0"
+source = "git+https://github.com/styris-ame/migrateable-rs#d3861fdd98c6f1891297d057a6d402c3f292ad56"
 dependencies = [
  "convert_case",
  "proc-macro-crate",

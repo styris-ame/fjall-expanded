@@ -661,6 +661,23 @@ impl LargeBlobReader {
         self.manifest.chunk_count()
     }
 
+    pub fn blob_id(&self) -> [u8; 16] {
+        self.manifest.blob_id
+    }
+
+    pub fn seek(&mut self, offset: u64) -> usize {
+        if offset >= self.manifest.total_len {
+            self.next_index = self.manifest.chunk_count();
+            return 0;
+        }
+        let chunk_size = u64::from(self.manifest.chunk_size).max(1);
+        self.next_index = u32::try_from(offset / chunk_size).unwrap_or(u32::MAX);
+        #[expect(clippy::cast_possible_truncation, reason = "the remainder is below a u32 chunk size")]
+        {
+            (offset % chunk_size) as usize
+        }
+    }
+
     pub fn next_chunk(&mut self) -> Result<Option<Slice>> {
         if self.next_index >= self.manifest.chunk_count() {
             return Ok(None);
