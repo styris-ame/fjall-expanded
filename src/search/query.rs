@@ -42,7 +42,7 @@ enum Kind {
 
 /// Parses `query` into clauses. Unquoted runs become one clause per word; a
 /// `"quoted phrase"` becomes a single clause whose lemmas are AND'd. A single
-/// leading marker selects the clause kind: `-` negates, `?` makes the clause
+/// leading marker selects the clause kind: `-` or `!` negates, `?` makes the clause
 /// optional, anything else is required. Items whose text yields no lemmas (too
 /// short, all punctuation) are dropped.
 pub fn parse_query(query: &str, min_token_length: usize) -> ParsedQuery {
@@ -58,7 +58,7 @@ pub fn parse_query(query: &str, min_token_length: usize) -> ParsedQuery {
         }
 
         let kind = match c {
-            '-' => {
+            '-' | '!' => {
                 chars.next();
                 Kind::Negative
             }
