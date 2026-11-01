@@ -1,7 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, OptimisticWriteTx, Slice};
 
 use crate::Readable;
@@ -10,14 +10,33 @@ use super::tokenizer::tokenize_positions;
 
 pub(super) const SEPARATOR: u8 = 0;
 
-/// Version-agnostic inverted index operating on raw `id_body` byte keys.
+/// Bytes the length of a document's id takes at the front of each of its bodies
+pub(super) const HEAD_LEN: usize = 2;
+
+/// Decides whether a part of a document counts for a search, given the document's
+/// id and the part's name. A document's main text always counts and is never
+/// asked about.
+pub(super) type Visible<'a> = dyn FnMut(&[u8], &[u8]) -> bool + 'a;
+
+/// A term's postings in one document, one for each part that counts and holds it
+type Found = Vec<(Vec<u8>, Slice)>;
+
+/// Version-agnostic inverted index operating on raw document ids.
+///
+/// A document is made of parts: its main text, which every search counts, and
+/// any number of named parts a search can leave out, so one document can show
+/// each searcher only what they may see. Each part is stored under its own id
+/// body, `u16 length of the document id ++ document id ++ part name`, where the
+/// main text's name is empty. The length keeps a document's parts next to each
+/// other and apart from any other document's, so a document can always be
+/// split back out of a body.
 ///
 /// Postings are laid out one key per `(term, id_body)` pair so updates are
 /// independent point inserts and removes. A term's posting list is a prefix
 /// scan, already sorted by id body, which lets multi-term queries intersect by
-/// merge. Each document's term set is stored separately so reindexing writes
-/// only the postings that actually changed. Callers that need versioning fold
-/// the version into `id_body`; this core never inspects it.
+/// merge. Each part's term set is stored separately so reindexing writes only
+/// the postings that actually changed. Callers that need versioning fold the
+/// version into the document id; this core never inspects it.
 pub(super) struct Index {
     pub(super) postings: OptimisticTxKeyspace,
     pub(super) documents: OptimisticTxKeyspace,
@@ -35,7 +54,50 @@ impl Clone for Index {
 }
 
 impl Index {
-    pub(super) fn index(&self, tx: &mut OptimisticWriteTx, id_body: &[u8], content: &str, min_token_length: usize) -> Result<()> {
+    /// Indexes a document as `parts`, each a part's name and its text, where the
+    /// empty name is the main text. Any part the document held before that isn't
+    /// among them is removed, and a part without words isn't kept.
+    pub(super) fn index(
+        &self,
+        tx: &mut OptimisticWriteTx,
+        doc: &[u8],
+        parts: &[(&[u8], &str)],
+        min_token_length: usize,
+    ) -> Result<()> {
+        let head = head_of(doc)?;
+        for (at, (part, _)) in parts.iter().enumerate() {
+            ensure!(parts[..at].iter().all(|(other, _)| other != part), "a document can't hold the same part twice");
+        }
+        let mut stale = self.bodies(&*tx, &head)?;
+        for (part, content) in parts {
+            let body = [head.as_slice(), part].concat();
+            stale.retain(|stale| stale.as_ref() != body.as_slice());
+            self.index_body(tx, &body, content, min_token_length)?;
+        }
+        for body in stale {
+            self.remove_body(tx, &body)?;
+        }
+        Ok(())
+    }
+
+    /// Removes every part of a document
+    pub(super) fn remove(&self, tx: &mut OptimisticWriteTx, doc: &[u8]) -> Result<()> {
+        for body in self.bodies(&*tx, &head_of(doc)?)? {
+            self.remove_body(tx, &body)?;
+        }
+        Ok(())
+    }
+
+    /// The bodies of every part a document holds, found by its head
+    fn bodies(&self, tx: &impl Readable, head: &[u8]) -> Result<Vec<Slice>> {
+        let mut bodies = Vec::new();
+        for guard in tx.prefix(&self.database, &self.documents, head) {
+            bodies.push(guard.key()?);
+        }
+        Ok(bodies)
+    }
+
+    fn index_body(&self, tx: &mut OptimisticWriteTx, id_body: &[u8], content: &str, min_token_length: usize) -> Result<()> {
         let new_positions = tokenize_positions(content, min_token_length);
         let old_counts = self.document_counts(&*tx, id_body)?;
 
@@ -62,7 +124,7 @@ impl Index {
         Ok(())
     }
 
-    pub(super) fn remove(&self, tx: &mut OptimisticWriteTx, id_body: &[u8]) -> Result<()> {
+    fn remove_body(&self, tx: &mut OptimisticWriteTx, id_body: &[u8]) -> Result<()> {
         if let Some(bytes) = tx.take(&self.documents, id_body)? {
             for term in decode_counts(bytes.as_ref()).keys() {
                 tx.remove(&self.postings, posting_key(term, id_body));
@@ -71,13 +133,19 @@ impl Index {
         Ok(())
     }
 
-    /// Scored AND/optional/exclusion search over pre-tokenized clauses.
+    /// Scored AND/optional/exclusion search over pre-tokenized clauses, giving the
+    /// ids of the documents found.
     ///
     /// Each clause is a set of terms that must all be present (AND). `required`
     /// clauses gate membership — a document must satisfy every one. With no
     /// required clauses the optionals are OR'd instead, and a document must
     /// satisfy at least one to appear. Documents satisfying any negative clause
     /// are dropped.
+    ///
+    /// A document is searched as the parts of it that count, as if they were one
+    /// text: a term is in it when any of them holds it, so a clause can be met by
+    /// terms from different parts, and a part that doesn't count can neither find
+    /// the document nor keep it out.
     ///
     /// Ranking is, in priority order:
     ///   1. coverage — how many optional clauses the document matches. A strict
@@ -86,13 +154,14 @@ impl Index {
     ///   2. relevance — an additive score summed over the matched query terms:
     ///        * word match: `WORD_MATCH_BASE` (10) + the term's length, so any
     ///          match is worth at least 10 and a longer, more specific word more;
-    ///        * frequency: +1 per extra occurrence of a term, capped at
-    ///          `FREQUENCY_CAP`, a mild tiebreak that can't outweigh matching a
-    ///          whole other word;
+    ///        * frequency: +1 per extra occurrence of a term over the parts that
+    ///          count, capped at `FREQUENCY_CAP`, a mild tiebreak that can't
+    ///          outweigh matching a whole other word;
     ///        * proximity: query terms found in order add `PROXIMITY_ADJACENT_BONUS`
     ///          (8) minus the tokens skipped between them, so adjacency lifts
     ///          "mckinley swab" over the same words apart or reversed, yet stays
     ///          below a single word match so it only refines, never dominates.
+    ///          Positions only compare within a part, so the closest part counts.
     ///   3. id ascending, for a stable order.
     pub(super) fn search_scored(
         &self,
@@ -100,78 +169,101 @@ impl Index {
         required: &[Vec<String>],
         optional: &[Vec<String>],
         negative: &[Vec<String>],
+        visible: &mut Visible,
     ) -> Result<Vec<Slice>> {
-        let mut coverage: HashMap<Vec<u8>, u32> = HashMap::new();
+        // Positive terms come first, in query order so proximity can score in-order
+        // closeness, then the terms only negatives use.
+        let scored = distinct_terms(required.iter().chain(optional)).len();
+        let terms = distinct_terms(required.iter().chain(optional).chain(negative));
+        let column = |term: &String| terms.iter().position(|t| t == term).unwrap();
 
-        if required.is_empty() {
+        // The required terms' postings come along with the documents holding them
+        // all, so only the other terms' lists are walked again
+        let required_terms: Vec<String> = required.iter().flatten().cloned().collect::<BTreeSet<_>>().into_iter().collect();
+        let (candidates, mut postings) = if required.is_empty() {
+            let mut union = BTreeSet::new();
             for clause in optional.iter().filter(|clause| !clause.is_empty()) {
-                for id in self.intersect_terms(tx, clause)? {
-                    *coverage.entry(id).or_insert(0) += 1;
-                }
+                union.extend(self.intersect_terms(tx, clause, visible)?.into_iter().map(|(head, _)| head));
             }
+            let candidates: Vec<Vec<u8>> = union.into_iter().collect();
+            let postings = vec![Vec::new(); candidates.len() * terms.len()];
+            (candidates, postings)
         } else {
-            let terms: Vec<String> = required.iter().flatten().cloned().collect::<BTreeSet<_>>().into_iter().collect();
-            for id in self.intersect_terms(tx, &terms)? {
-                coverage.insert(id, 0);
-            }
-            for clause in optional.iter().filter(|clause| !clause.is_empty()) {
-                for id in self.intersect_terms(tx, clause)? {
-                    if let Some(hits) = coverage.get_mut(&id) {
-                        *hits += 1;
-                    }
+            let found = self.intersect_terms(tx, &required_terms, visible)?;
+            let mut postings = vec![Vec::new(); found.len() * terms.len()];
+            let mut candidates = Vec::with_capacity(found.len());
+            for (row, (head, each)) in found.into_iter().enumerate() {
+                for (term, found) in required_terms.iter().zip(each) {
+                    postings[row * terms.len() + column(term)] = found;
                 }
+                candidates.push(head);
             }
-        }
-
-        for clause in negative.iter().filter(|clause| !clause.is_empty()) {
-            for id in self.intersect_terms(tx, clause)? {
-                coverage.remove(&id);
-            }
-        }
-
-        if coverage.is_empty() {
+            (candidates, postings)
+        };
+        if candidates.is_empty() {
             return Ok(Vec::new());
         }
+        let walked: Vec<usize> = (0..terms.len()).filter(|&at| !required_terms.contains(&terms[at])).collect();
+        self.candidate_postings(tx, &terms, &walked, &candidates, &mut postings, visible)?;
+        let columns = |clauses: &[Vec<String>]| -> Vec<Vec<usize>> {
+            clauses.iter().filter(|clause| !clause.is_empty()).map(|clause| clause.iter().map(column).collect()).collect()
+        };
+        let (optional_columns, negative_columns) = (columns(optional), columns(negative));
 
-        // Relevance is computed per surviving candidate rather than by rescanning
-        // whole posting lists: coverage has already done the coarse sorting, and each
-        // candidate's postings are a handful of point reads. Terms are visited in
-        // query order so proximity can score in-order closeness.
-        let ordered = ordered_terms(required, optional);
-        let mut ranked: Vec<(Vec<u8>, u32, u64)> = Vec::with_capacity(coverage.len());
-        for (id, hits) in coverage {
-            let mut relevance = 0u64;
-            let mut positions_in_order: Vec<Vec<u32>> = Vec::with_capacity(ordered.len());
-            for term in &ordered {
-                match tx.get(&self.postings, posting_key(term, &id))? {
-                    Some(value) => {
-                        let count = decode_count(value.as_ref());
-                        relevance += WORD_MATCH_BASE + term.len() as u64;
-                        relevance += u64::from(count.saturating_sub(1).min(FREQUENCY_CAP));
-                        positions_in_order.push(decode_positions(value.as_ref()));
-                    }
-                    None => positions_in_order.push(Vec::new()),
-                }
+        let mut ranked: Vec<(Vec<u8>, usize, u64)> = Vec::with_capacity(candidates.len());
+        for (row, head) in postings.chunks_exact(terms.len()).zip(candidates) {
+            let matches = |clause: &Vec<usize>| clause.iter().all(|&column| !row[column].is_empty());
+            if negative_columns.iter().any(matches) {
+                continue;
             }
-            relevance += proximity_boost(&positions_in_order);
-            ranked.push((id, hits, relevance));
+            let hits = optional_columns.iter().filter(|clause| matches(clause)).count();
+            ranked.push((head, hits, relevance(&terms[..scored], &row[..scored])));
         }
 
         ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)).then_with(|| a.0.cmp(&b.0)));
-        Ok(ranked.into_iter().map(|(id, ..)| Slice::from(id)).collect())
+        Ok(ranked.into_iter().map(|(head, ..)| Slice::from(&head[HEAD_LEN..])).collect())
     }
 
-    /// Every id body whose document contains all of `terms`, sorted ascending,
-    /// intersecting the per-term posting lists by k-way merge-join.
-    fn intersect_terms(&self, tx: &impl Readable, terms: &[String]) -> Result<Vec<Vec<u8>>> {
+    /// Fills in the postings of the terms at `columns` for each of the documents
+    /// `heads` lead, sorted, a row of terms per document. Every term's list is
+    /// walked once alongside the documents rather than read a point at a time. A
+    /// point read checks the table's bloom filter, and a filter too big for the
+    /// block cache is reloaded on every read.
+    fn candidate_postings(
+        &self,
+        tx: &impl Readable,
+        terms: &[String],
+        columns: &[usize],
+        heads: &[Vec<u8>],
+        postings: &mut [Found],
+        visible: &mut Visible,
+    ) -> Result<()> {
+        for &column in columns {
+            let mut cursor = TermCursor::open(tx, &self.database, &self.postings, &terms[column])?;
+            for (row, head) in heads.iter().enumerate() {
+                cursor.seek(head)?;
+                postings[row * terms.len() + column] = cursor.take_document(head, visible)?;
+                if cursor.current.is_none() {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Every document whose parts that count hold all of `terms` between them,
+    /// sorted by head, with each term's postings in it, intersecting the per-term
+    /// posting lists document by document with a k-way merge-join.
+    fn intersect_terms(&self, tx: &impl Readable, terms: &[String], visible: &mut Visible) -> Result<Vec<(Vec<u8>, Vec<Found>)>> {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
 
         let mut cursors = Vec::with_capacity(terms.len());
         for term in terms {
-            let cursor = TermCursor::open(tx, &self.database, &self.postings, term, Bound::Included(term_prefix(term)))?;
-            if cursor.current.is_none() {
+            let mut cursor = TermCursor::open(tx, &self.database, &self.postings, term)?;
+            cursor.settle(visible)?;
+            if cursor.head().is_none() {
                 return Ok(Vec::new());
             }
             cursors.push(cursor);
@@ -179,33 +271,37 @@ impl Index {
 
         let mut results = Vec::new();
         loop {
-            let mut max = cursors[0].current.clone().unwrap();
+            let mut max = cursors[0].head().unwrap().to_vec();
             for cursor in &cursors[1..] {
-                let value = cursor.current.as_ref().unwrap();
-                if value > &max {
-                    max = value.clone();
+                let head = cursor.head().unwrap();
+                if head > max.as_slice() {
+                    max = head.to_vec();
                 }
             }
 
             let mut all_equal = true;
             for cursor in cursors.iter_mut() {
-                if cursor.current.as_ref().unwrap() < &max {
-                    cursor.seek(tx, &self.database, &self.postings, &max)?;
-                    match &cursor.current {
-                        None => return Ok(results),
-                        Some(value) if value != &max => all_equal = false,
-                        Some(_) => {}
-                    }
+                if cursor.head().is_some_and(|head| head < max.as_slice()) {
+                    cursor.seek(&max)?;
+                    cursor.settle(visible)?;
+                }
+                match cursor.head() {
+                    None => return Ok(results),
+                    Some(head) if head != max.as_slice() => all_equal = false,
+                    Some(_) => {}
                 }
             }
 
             if all_equal {
-                results.push(max);
+                let mut found = Vec::with_capacity(cursors.len());
                 for cursor in cursors.iter_mut() {
-                    cursor.advance()?;
-                    if cursor.current.is_none() {
-                        return Ok(results);
-                    }
+                    found.push(cursor.take_document(&max, visible)?);
+                    cursor.settle(visible)?;
+                }
+                let done = cursors.iter().any(|cursor| cursor.head().is_none());
+                results.push((max, found));
+                if done {
+                    return Ok(results);
                 }
             }
         }
@@ -227,41 +323,68 @@ pub(super) fn posting_key(term: &str, id_body: &[u8]) -> Slice {
     Slice::from(key)
 }
 
-fn term_prefix(term: &str) -> Vec<u8> {
-    let mut prefix = Vec::with_capacity(term.len() + 1);
-    prefix.extend_from_slice(term.as_bytes());
-    prefix.push(SEPARATOR);
-    prefix
+/// What every body of a document starts with: its id behind the id's length
+pub(super) fn head_of(doc: &[u8]) -> Result<Vec<u8>> {
+    let len = u16::try_from(doc.len()).context("a document's id can't be longer than 64 KiB")?;
+    let mut head = Vec::with_capacity(HEAD_LEN + doc.len());
+    head.extend_from_slice(&len.to_be_bytes());
+    head.extend_from_slice(doc);
+    Ok(head)
 }
 
-fn term_upper(term: &str) -> Vec<u8> {
-    let mut upper = Vec::with_capacity(term.len() + 1);
-    upper.extend_from_slice(term.as_bytes());
-    upper.push(SEPARATOR + 1);
-    upper
+/// A document's main `content` and its named `parts`, as [`Index::index`] takes them
+pub(super) fn named_parts<'a, S: AsRef<str>>(content: &'a str, parts: &'a [(Slice, S)]) -> Result<Vec<(&'a [u8], &'a str)>> {
+    let mut named: Vec<(&[u8], &str)> = Vec::with_capacity(parts.len() + 1);
+    named.push((&[], content));
+    for (part, text) in parts {
+        ensure!(!part.is_empty(), "a document's part needs a name");
+        named.push((part.as_ref(), text.as_ref()));
+    }
+    Ok(named)
 }
 
-struct TermCursor {
-    prefix_len: usize,
+/// A body split into its document's head and the part's name
+pub(super) fn split_body(body: &[u8]) -> (&[u8], &[u8]) {
+    let len = match body {
+        [high, low, ..] => usize::from(u16::from_be_bytes([*high, *low])),
+        _ => 0,
+    };
+    body.split_at((HEAD_LEN + len).min(body.len()))
+}
+
+/// Whether a part of the document `head` leads counts for a search
+fn counts(visible: &mut Visible, head: &[u8], part: &[u8]) -> bool {
+    part.is_empty() || visible(&head[HEAD_LEN.min(head.len())..], part)
+}
+
+/// How many postings [`TermCursor::seek`] steps over before reopening its range
+/// at the target instead. Opening a range costs a dozen steps or so with its
+/// index block cached, and far more when the block has to be read again.
+const SEEK_STEPS: usize = 64;
+
+/// Walks one term's posting list in id order, holding the current id body and posting.
+struct TermCursor<'a, R: Readable> {
+    tx: &'a R,
+    database: &'a OptimisticTxDatabase,
+    keyspace: &'a OptimisticTxKeyspace,
     prefix: Vec<u8>,
     upper: Vec<u8>,
     iter: fjall::Iter,
-    current: Option<Vec<u8>>,
+    current: Option<(Vec<u8>, Slice)>,
 }
 
-impl TermCursor {
-    fn open(
-        tx: &impl Readable,
-        database: &OptimisticTxDatabase,
-        keyspace: &OptimisticTxKeyspace,
-        term: &str,
-        lower: Bound<Vec<u8>>,
-    ) -> Result<Self> {
-        let prefix = term_prefix(term);
-        let upper = term_upper(term);
-        let iter = tx.range(database, keyspace, (lower, Bound::Excluded(upper.clone())));
+impl<'a, R: Readable> TermCursor<'a, R> {
+    fn open(tx: &'a R, database: &'a OptimisticTxDatabase, keyspace: &'a OptimisticTxKeyspace, term: &str) -> Result<Self> {
+        let mut prefix = Vec::with_capacity(term.len() + 1);
+        prefix.extend_from_slice(term.as_bytes());
+        prefix.push(SEPARATOR);
+        let mut upper = prefix.clone();
+        *upper.last_mut().unwrap() = SEPARATOR + 1;
+        let iter = tx.range(database, keyspace, (Bound::Included(prefix.clone()), Bound::Excluded(upper.clone())));
         let mut cursor = Self {
-            prefix_len: prefix.len(),
+            tx,
+            database,
+            keyspace,
             prefix,
             upper,
             iter,
@@ -271,45 +394,114 @@ impl TermCursor {
         Ok(cursor)
     }
 
-    fn seek(
-        &mut self,
-        tx: &impl Readable,
-        database: &OptimisticTxDatabase,
-        keyspace: &OptimisticTxKeyspace,
-        target: &[u8],
-    ) -> Result<()> {
+    fn id(&self) -> Option<&[u8]> {
+        self.current.as_ref().map(|(id, _)| id.as_slice())
+    }
+
+    /// The head of the document the current posting is in
+    fn head(&self) -> Option<&[u8]> {
+        self.id().map(|body| split_body(body).0)
+    }
+
+    /// Moves to the first posting at or after `target`, never backwards. Near
+    /// targets are stepped to and far ones reopen the range there.
+    fn seek(&mut self, target: &[u8]) -> Result<()> {
+        for _ in 0..SEEK_STEPS {
+            if self.id().is_none_or(|id| id >= target) {
+                return Ok(());
+            }
+            self.pull()?;
+        }
+        if self.id().is_none_or(|id| id >= target) {
+            return Ok(());
+        }
         let mut lower = Vec::with_capacity(self.prefix.len() + target.len());
         lower.extend_from_slice(&self.prefix);
         lower.extend_from_slice(target);
-        self.iter = tx.range(database, keyspace, (Bound::Included(lower), Bound::Excluded(self.upper.clone())));
+        self.iter = self.tx.range(self.database, self.keyspace, (Bound::Included(lower), Bound::Excluded(self.upper.clone())));
         self.pull()
     }
 
-    fn advance(&mut self) -> Result<()> {
-        self.pull()
+    /// Steps over postings in parts that don't count, to rest on one that does
+    fn settle(&mut self, visible: &mut Visible) -> Result<()> {
+        while let Some(body) = self.id() {
+            let (head, part) = split_body(body);
+            if counts(visible, head, part) {
+                return Ok(());
+            }
+            self.pull()?;
+        }
+        Ok(())
+    }
+
+    /// The postings in parts that count of the document `head` leads, from where
+    /// the cursor is, moving past all of that document's
+    fn take_document(&mut self, head: &[u8], visible: &mut Visible) -> Result<Found> {
+        let mut found = Vec::new();
+        while let Some((body, posting)) = &self.current {
+            let (at, part) = split_body(body);
+            if at != head {
+                break;
+            }
+            if counts(visible, at, part) {
+                found.push((part.to_vec(), posting.clone()));
+            }
+            self.pull()?;
+        }
+        Ok(found)
     }
 
     fn pull(&mut self) -> Result<()> {
         self.current = match self.iter.next() {
-            Some(guard) => Some(guard.key()?.as_ref()[self.prefix_len..].to_vec()),
+            Some(guard) => {
+                let (key, value) = guard.into_inner()?;
+                Some((key.as_ref()[self.prefix.len()..].to_vec(), value))
+            }
             None => None,
         };
         Ok(())
     }
 }
 
-/// The distinct positive query terms in query order (required clauses first,
-/// then optional), first occurrence wins. Order matters so proximity can score
-/// terms in the sequence the user typed them.
-fn ordered_terms(required: &[Vec<String>], optional: &[Vec<String>]) -> Vec<String> {
-    let mut seen = HashMap::new();
-    let mut ordered = Vec::new();
-    for term in required.iter().chain(optional).flatten() {
-        if seen.insert(term.clone(), ()).is_none() {
-            ordered.push(term.clone());
+/// The distinct terms of `clauses` in the order given, first occurrence wins.
+fn distinct_terms<'a>(clauses: impl IntoIterator<Item = &'a Vec<String>>) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for term in clauses.into_iter().flatten() {
+        if !terms.contains(term) {
+            terms.push(term.clone());
         }
     }
-    ordered
+    terms
+}
+
+/// A document's relevance, given each positive query term in query order and the
+/// postings the document's parts that count have for it.
+fn relevance(terms: &[String], postings: &[Found]) -> u64 {
+    let mut relevance = 0u64;
+    for (term, found) in terms.iter().zip(postings) {
+        if found.is_empty() {
+            continue;
+        }
+        let count = found.iter().map(|(_, posting)| decode_count(posting.as_ref())).fold(0, u32::saturating_add);
+        relevance += WORD_MATCH_BASE + term.len() as u64;
+        relevance += u64::from(count.saturating_sub(1).min(FREQUENCY_CAP));
+    }
+    let parts: BTreeSet<&[u8]> = postings.iter().flatten().map(|(part, _)| part.as_slice()).collect();
+    let closest = parts
+        .into_iter()
+        .map(|part| {
+            let positions_in_order: Vec<Vec<u32>> = postings
+                .iter()
+                .map(|found| match found.iter().find(|(other, _)| other.as_slice() == part) {
+                    Some((_, posting)) => decode_positions(posting.as_ref()),
+                    None => Vec::new(),
+                })
+                .collect();
+            proximity_boost(&positions_in_order)
+        })
+        .max()
+        .unwrap_or(0);
+    relevance + closest
 }
 
 /// Points for matching a query term, before its length is added. Every match is
@@ -369,14 +561,6 @@ pub(super) fn encode_posting(positions: &[u32]) -> Slice {
         write_varint(&mut buf, u64::from(position - previous));
         previous = position;
     }
-    Slice::from(buf)
-}
-
-/// Posting value: the term's occurrence count in that document as a varint,
-/// still used by the version-migration path which has no positions to carry.
-pub(super) fn encode_count(count: u32) -> Slice {
-    let mut buf = Vec::with_capacity(5);
-    write_varint(&mut buf, count as u64);
     Slice::from(buf)
 }
 
