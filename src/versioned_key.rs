@@ -1,6 +1,7 @@
 use std::{
     hash::{Hash, Hasher},
     marker::PhantomData,
+    ops::{Bound, RangeBounds},
 };
 
 use fjall::Slice;
@@ -13,6 +14,29 @@ pub(crate) fn make_versioned_prefix<P: AsRef<[u8]>>(key_version: u8, value_versi
     result.push(value_version);
     result.extend_from_slice(prefix.as_ref());
     result
+}
+
+/// Turns bounds over keys as callers encode them into bounds over the stored, version-prefixed keys. An open
+/// end stops at the edge of the given versions' keys rather than running into other versions.
+pub(crate) fn make_versioned_range<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+    key_version: u8,
+    value_version: u8,
+    range: R,
+) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
+    let versioned = |key: &RK| make_versioned_prefix(key_version, value_version, key);
+    let start = match range.start_bound() {
+        Bound::Included(key) => Bound::Included(versioned(key)),
+        Bound::Excluded(key) => Bound::Excluded(versioned(key)),
+        Bound::Unbounded => Bound::Included(vec![key_version, value_version]),
+    };
+    let end = match range.end_bound() {
+        Bound::Included(key) => Bound::Included(versioned(key)),
+        Bound::Excluded(key) => Bound::Excluded(versioned(key)),
+        Bound::Unbounded if value_version < u8::MAX => Bound::Excluded(vec![key_version, value_version + 1]),
+        Bound::Unbounded if key_version < u8::MAX => Bound::Excluded(vec![key_version + 1]),
+        Bound::Unbounded => Bound::Unbounded,
+    };
+    (start, end)
 }
 
 pub struct VersionedKey<T: KeySource<T>>(Slice, PhantomData<T>);

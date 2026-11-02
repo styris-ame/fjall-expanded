@@ -88,28 +88,6 @@ where
         })
     }
 
-    pub fn range<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
-        &self,
-        tx: &impl Readable,
-        range: R,
-    ) -> impl Iterator<Item = Result<(SpaceKey<K>, V)>> {
-        tx.range(&self.database, &self.inner, range).map(|guard| {
-            let (key, value) = guard.into_inner()?;
-            Ok((key.into(), V::try_from(value).map_err(Into::into)?))
-        })
-    }
-
-    pub fn range_rev<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
-        &self,
-        tx: &impl Readable,
-        range: R,
-    ) -> impl Iterator<Item = Result<(SpaceKey<K>, V)>> {
-        tx.range(&self.database, &self.inner, range).rev().map(|guard| {
-            let (key, value) = guard.into_inner()?;
-            Ok((key.into(), V::try_from(value).map_err(Into::into)?))
-        })
-    }
-
     pub fn approximate_len(&self) -> usize {
         self.inner.inner().approximate_len()
     }
@@ -221,6 +199,84 @@ where
 
     pub fn iter_values_prefixed_rev<P: AsRef<[u8]>>(&self, tx: &impl Readable, prefix: P) -> impl Iterator<Item = Result<V>> {
         tx.prefix(&self.database, &self.inner, prefix).rev().map(|guard| {
+            let raw = guard.value()?;
+            V::try_from(raw).map_err(Into::into)
+        })
+    }
+
+    // ── Range scans ────────────────────────────────────────────────
+
+    pub fn range<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = Result<(SpaceKey<K>, V)>> {
+        tx.range(&self.database, &self.inner, range).map(|guard| {
+            let (key, value) = guard.into_inner()?;
+            Ok((key.into(), V::try_from(value).map_err(Into::into)?))
+        })
+    }
+
+    pub fn range_guarded<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = DataGuard<K, V>> {
+        tx.range(&self.database, &self.inner, range).map(|g| DataGuard::new(g))
+    }
+
+    pub fn range_keys<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = Result<SpaceKey<K>>> {
+        tx.range(&self.database, &self.inner, range).map(|guard| Ok(guard.key()?.into()))
+    }
+
+    pub fn range_values<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = Result<V>> {
+        tx.range(&self.database, &self.inner, range).map(|guard| {
+            let raw = guard.value()?;
+            V::try_from(raw).map_err(Into::into)
+        })
+    }
+
+    pub fn range_rev<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = Result<(SpaceKey<K>, V)>> {
+        tx.range(&self.database, &self.inner, range).rev().map(|guard| {
+            let (key, value) = guard.into_inner()?;
+            Ok((key.into(), V::try_from(value).map_err(Into::into)?))
+        })
+    }
+
+    pub fn range_guarded_rev<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = DataGuard<K, V>> {
+        tx.range(&self.database, &self.inner, range).rev().map(|g| DataGuard::new(g))
+    }
+
+    pub fn range_keys_rev<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = Result<SpaceKey<K>>> {
+        tx.range(&self.database, &self.inner, range).rev().map(|guard| Ok(guard.key()?.into()))
+    }
+
+    pub fn range_values_rev<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = Result<V>> {
+        tx.range(&self.database, &self.inner, range).rev().map(|guard| {
             let raw = guard.value()?;
             V::try_from(raw).map_err(Into::into)
         })

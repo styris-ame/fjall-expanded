@@ -173,17 +173,6 @@ where
         })
     }
 
-    pub fn range<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
-        &self,
-        tx: &impl Readable,
-        range: R,
-    ) -> impl Iterator<Item = fjall::Result<(SpaceKey<K>, TrustedRkyv<V>)>> {
-        tx.range(&self.database, &self.inner, range).map(|guard| {
-            let (key, value) = guard.into_inner()?;
-            Ok((key.into(), TrustedRkyv::new(value)))
-        })
-    }
-
     pub fn is_empty(&self, tx: &impl Readable) -> fjall::Result<bool> {
         tx.is_empty(&self.database, &self.inner)
     }
@@ -303,6 +292,84 @@ where
         prefix: P,
     ) -> impl Iterator<Item = fjall::Result<TrustedRkyv<V>>> {
         tx.prefix(&self.database, &self.inner, prefix).rev().map(|guard| {
+            let raw = guard.value()?;
+            Ok(TrustedRkyv::new(raw))
+        })
+    }
+
+    // ── Range scans ────────────────────────────────────────────────
+
+    pub fn range<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = fjall::Result<(SpaceKey<K>, TrustedRkyv<V>)>> {
+        tx.range(&self.database, &self.inner, range).map(|guard| {
+            let (key, value) = guard.into_inner()?;
+            Ok((key.into(), TrustedRkyv::new(value)))
+        })
+    }
+
+    pub fn range_guarded<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = RkyvGuard<K, V>> {
+        tx.range(&self.database, &self.inner, range).map(|g| RkyvGuard::new(g))
+    }
+
+    pub fn range_keys<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = fjall::Result<SpaceKey<K>>> {
+        tx.range(&self.database, &self.inner, range).map(|guard| Ok(guard.key()?.into()))
+    }
+
+    pub fn range_values<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = fjall::Result<TrustedRkyv<V>>> {
+        tx.range(&self.database, &self.inner, range).map(|guard| {
+            let raw = guard.value()?;
+            Ok(TrustedRkyv::new(raw))
+        })
+    }
+
+    pub fn range_rev<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = fjall::Result<(SpaceKey<K>, TrustedRkyv<V>)>> {
+        tx.range(&self.database, &self.inner, range).rev().map(|guard| {
+            let (key, value) = guard.into_inner()?;
+            Ok((key.into(), TrustedRkyv::new(value)))
+        })
+    }
+
+    pub fn range_guarded_rev<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = RkyvGuard<K, V>> {
+        tx.range(&self.database, &self.inner, range).rev().map(|g| RkyvGuard::new(g))
+    }
+
+    pub fn range_keys_rev<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = fjall::Result<SpaceKey<K>>> {
+        tx.range(&self.database, &self.inner, range).rev().map(|guard| Ok(guard.key()?.into()))
+    }
+
+    pub fn range_values_rev<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = fjall::Result<TrustedRkyv<V>>> {
+        tx.range(&self.database, &self.inner, range).rev().map(|guard| {
             let raw = guard.value()?;
             Ok(TrustedRkyv::new(raw))
         })

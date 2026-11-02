@@ -16,11 +16,11 @@ use rkyv::{Archive, Deserialize, Portable, Serialize, rancor};
 
 use crate::schema_map_space::{SpaceSchema, ValidatedSchema};
 use crate::SchemaMapSpace;
-use crate::versioned_key::make_versioned_prefix;
+use crate::versioned_key::{make_versioned_prefix, make_versioned_range};
 use crate::versioned_key_slice::ToVersionedKeySlice;
 use crate::{KeySource, ReturnType, VersionedKey};
 
-use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, OptimisticWriteTx, OwnedWriteBatch};
+use fjall::{Iter, OptimisticTxDatabase, OptimisticTxKeyspace, OptimisticWriteTx, OwnedWriteBatch};
 
 use crate::managed_database::{SpaceGroup, SpaceOptions};
 use crate::{IterExtensions, Readable, WriteTxExtensions};
@@ -410,17 +410,6 @@ where
         })
     }
 
-    pub fn range<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
-        &self,
-        tx: &impl Readable,
-        range: R,
-    ) -> impl Iterator<Item = fjall::Result<(VersionedKey<K::Current>, TrustedRkyv<V::Current>)>> {
-        tx.range(&self.database, &self.inner, range).map(|guard| {
-            let (key, value) = guard.into_inner()?;
-            Ok((key.into(), TrustedRkyv::new(value)))
-        })
-    }
-
     pub fn is_empty(&self, tx: &impl Readable) -> fjall::Result<bool> {
         tx.is_empty(&self.database, &self.inner)
     }
@@ -566,6 +555,91 @@ where
                 let raw = guard.value()?;
                 Ok(TrustedRkyv::new(raw))
             })
+    }
+
+    // ── Range scans ────────────────────────────────────────────────
+    //
+    // Bounds are over keys as they're encoded, without the version prefix, which
+    // is added here like the prefixed scans add it.
+
+    fn stored_range<RK: AsRef<[u8]>, R: RangeBounds<RK>>(&self, tx: &impl Readable, range: R) -> Iter {
+        tx.range(&self.database, &self.inner, make_versioned_range(K::CURRENT_VERSION, V::CURRENT_VERSION, range))
+    }
+
+    pub fn range<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = fjall::Result<(VersionedKey<K::Current>, TrustedRkyv<V::Current>)>> {
+        self.stored_range(tx, range).map(|guard| {
+            let (key, value) = guard.into_inner()?;
+            Ok((key.into(), TrustedRkyv::new(value)))
+        })
+    }
+
+    pub fn range_guarded<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = RkyvGuard<K::Current, V::Current>> {
+        self.stored_range(tx, range).map(|g| RkyvGuard::new(g))
+    }
+
+    pub fn range_keys<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = fjall::Result<VersionedKey<K::Current>>> {
+        self.stored_range(tx, range).map(|guard| Ok(guard.key()?.into()))
+    }
+
+    pub fn range_values<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = fjall::Result<TrustedRkyv<V::Current>>> {
+        self.stored_range(tx, range).map(|guard| {
+            let raw = guard.value()?;
+            Ok(TrustedRkyv::new(raw))
+        })
+    }
+
+    pub fn range_rev<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = fjall::Result<(VersionedKey<K::Current>, TrustedRkyv<V::Current>)>> {
+        self.stored_range(tx, range).rev().map(|guard| {
+            let (key, value) = guard.into_inner()?;
+            Ok((key.into(), TrustedRkyv::new(value)))
+        })
+    }
+
+    pub fn range_guarded_rev<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = RkyvGuard<K::Current, V::Current>> {
+        self.stored_range(tx, range).rev().map(|g| RkyvGuard::new(g))
+    }
+
+    pub fn range_keys_rev<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = fjall::Result<VersionedKey<K::Current>>> {
+        self.stored_range(tx, range).rev().map(|guard| Ok(guard.key()?.into()))
+    }
+
+    pub fn range_values_rev<RK: AsRef<[u8]>, R: RangeBounds<RK>>(
+        &self,
+        tx: &impl Readable,
+        range: R,
+    ) -> impl Iterator<Item = fjall::Result<TrustedRkyv<V::Current>>> {
+        self.stored_range(tx, range).rev().map(|guard| {
+            let raw = guard.value()?;
+            Ok(TrustedRkyv::new(raw))
+        })
     }
 }
 
